@@ -7,10 +7,9 @@
 
 import SwiftUI
 import UserNotifications
-import Combine
 
-// MARK: - App Delegate (for delegate conformance)
-final class AppDelegate: NSObject, UIApplicationDelegate {
+// MARK: - App Delegate (ensures foreground banners)
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
@@ -18,10 +17,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         UNUserNotificationCenter.current().delegate = self
         return true
     }
-}
 
-extension AppDelegate: UNUserNotificationCenterDelegate {
-    // Allow foreground banners
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
@@ -33,7 +29,7 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
 // MARK: - Notification Manager
 @MainActor
-final class RestraintModel: ObservableObject {
+final class NotificationManager: ObservableObject {
     private let center = UNUserNotificationCenter.current()
 
     // 120-step pattern
@@ -52,41 +48,18 @@ final class RestraintModel: ObservableObject {
         11, 15, 20, 20, 10, 20, 11, 18, 20, 16
     ]
 
-    @Published var running = false
-    @Published var elapsed: TimeInterval = 0
-    @Published var ignoredCount = 0
-
-    private var startDate: Date?
-    private var cancellables = Set<AnyCancellable>()
-
-    init() {
-        Timer.publish(every: 0.1, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                guard let self = self, self.running, let start = self.startDate else { return }
-                self.elapsed = Date().timeIntervalSince(start)
-                self.updateIgnored()
-            }
-            .store(in: &cancellables)
-    }
-
     func requestPermission() async {
-        _ = try? await center.requestAuthorization(options: [.alert, .sound])
+        do {
+            try await center.requestAuthorization(options: [.alert, .sound])
+        } catch {
+            print("No permission")
+        }
     }
 
-    func start() {
-        running = true
-        startDate = Date()
-        schedulePattern()
-    }
-
-    func stop() {
-        running = false
+    func setScheduled(enabled: Bool) {
         center.removeAllPendingNotificationRequests()
-    }
+        guard enabled else { return }
 
-    private func schedulePattern() {
-        center.removeAllPendingNotificationRequests()
         var cumulative = 0.0
         for (index, min) in minutes.enumerated() {
             cumulative += Double(min) * 60
@@ -98,73 +71,70 @@ final class RestraintModel: ObservableObject {
                 repeats: false
             )
             let request = UNNotificationRequest(
-                identifier: "pat-\(index)",
+                identifier: "pattern-\(index)",
                 content: content,
                 trigger: trigger
             )
             center.add(request)
         }
     }
+}
 
-    private func updateIgnored() {
-        guard let start = startDate else { return }
-        let elapsedMin = elapsed / 60
-        var shouldHaveFired = 0
-        var total = 0
-        for min in minutes {
-            total += min
-            if Double(total) <= elapsedMin {
-                shouldHaveFired += 1
+// MARK: - Custom Switch (unchanged look)
+struct CustomSwitch: View {
+    @Binding var isOn: Bool
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 25)
+            .frame(width: 60, height: 35)
+            .scaleEffect(isOn ? 1.5 : 1.0)
+            .foregroundColor(isOn ? .green : .gray)
+            .overlay(
+                RoundedRectangle(cornerRadius: 15)
+                    .frame(width: 35, height: 35)
+                    .foregroundColor(isOn ? .white : .gray)
+                    .offset(x: isOn ? 25 : 0, y: 0)
+            )
+            .onTapGesture {
+                withAnimation {
+                    isOn.toggle()
+                }
             }
-        }
-        center.getPendingNotificationRequests { pending in
-            DispatchQueue.main.async {
-                self.ignoredCount = shouldHaveFired - (self.minutes.count - pending.count)
-            }
-        }
+            .padding(.vertical, 8)
     }
 }
 
-// MARK: - SwiftUI View
-struct RestraintView: View {
-    @StateObject private var model = RestraintModel()
+// MARK: - Content View
+struct ContentView: View {
+    @State private var isOn = false
+    @StateObject private var nm = NotificationManager()
 
     var body: some View {
-        VStack(spacing: 30) {
-            Text("Restraint")
-                .font(.largeTitle.bold())
+        ZStack {
+            Color.gray.opacity(0.2).ignoresSafeArea()
+            VStack(spacing: 16) {
+                Text("Notifications")
+                    .font(.largeTitle.bold())
+                    .padding(.bottom, 8)
 
-            Button(action: {
-                if model.running {
-                    model.stop()
-                } else {
-                    model.start()
-                }
-            }) {
-                Text(model.running ? "Stop" : "Start")
-                    .font(.title.bold())
-                    .frame(maxWidth: .infinity, minHeight: 60)
+                CustomSwitch(isOn: $isOn)
+                    .onChange(of: isOn) { _, newValue in
+                        nm.setScheduled(enabled: newValue)
+                    }
+
+                Text(isOn ? "ON" : "OFF")
+                    .font(.title2)
+                    .foregroundColor(isOn ? .green : .gray)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(model.running ? .red : .green)
-            .animation(.default, value: model.running)
-
-            if model.running {
-                Group {
-                    Text("Time elapsed")
-                    Text(String(format: "%.1f s", model.elapsed))
-                        .font(.title2.monospacedDigit())
-
-                    Text("Notifications ignored")
-                    Text("\(model.ignoredCount)")
-                        .font(.title2.monospacedDigit())
-                }
-                .transition(.opacity)
-            }
+            .padding(32)
+            .background(Color.white)
+            .cornerRadius(20)
+            .shadow(color: .black.opacity(0.1), radius: 10, x: 0, y: 4)
         }
-        .padding()
-        .task {
-            await model.requestPermission()
+        .onAppear {
+            Task {
+                await nm.requestPermission()
+            }
         }
     }
 }
@@ -176,7 +146,7 @@ struct RestraintApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RestraintView()
+            ContentView()
         }
     }
 }
