@@ -1,11 +1,41 @@
+//
+//  RestraintApp.swift
+//  Restraint
+//
+//  Created by Ethan Tan on 4/8/2025
+//
+
 import SwiftUI
 import UserNotifications
 import Combine
 
+// MARK: - App Delegate (for delegate conformance)
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        UNUserNotificationCenter.current().delegate = self
+        return true
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    // Allow foreground banners
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+}
+
+// MARK: - Notification Manager
 @MainActor
 final class RestraintModel: ObservableObject {
     private let center = UNUserNotificationCenter.current()
-    
+
     // 120-step pattern
     private let minutes: [Int] = [
         15, 20, 13, 10, 10, 18, 11, 12, 14, 14,
@@ -21,42 +51,40 @@ final class RestraintModel: ObservableObject {
         10, 16, 17, 14, 14, 19, 20, 11, 13, 11,
         11, 15, 20, 20, 10, 20, 11, 18, 20, 16
     ]
-    
+
     @Published var running = false
     @Published var elapsed: TimeInterval = 0
     @Published var ignoredCount = 0
-    
+
     private var startDate: Date?
     private var cancellables = Set<AnyCancellable>()
-    
+
     init() {
         Timer.publish(every: 0.1, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                guard let self = self else { return }
-                if self.running, let start = self.startDate {
-                    self.elapsed = Date().timeIntervalSince(start)
-                    self.updateIgnored()
-                }
+                guard let self = self, self.running, let start = self.startDate else { return }
+                self.elapsed = Date().timeIntervalSince(start)
+                self.updateIgnored()
             }
             .store(in: &cancellables)
     }
-    
+
     func requestPermission() async {
         _ = try? await center.requestAuthorization(options: [.alert, .sound])
     }
-    
+
     func start() {
         running = true
         startDate = Date()
         schedulePattern()
     }
-    
+
     func stop() {
         running = false
         center.removeAllPendingNotificationRequests()
     }
-    
+
     private func schedulePattern() {
         center.removeAllPendingNotificationRequests()
         var cumulative = 0.0
@@ -65,58 +93,47 @@ final class RestraintModel: ObservableObject {
             let content = UNMutableNotificationContent()
             content.title = "ping"
             content.sound = .default
-            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: cumulative, repeats: false)
-            let req = UNNotificationRequest(identifier: "pat-\(index)", content: content, trigger: trigger)
-            center.add(req)
-        }
-    }
-    
-    private func updateIgnored() {
-        guard let start = startDate else { return }
-        let elapsedMin = elapsed / 60
-        let shouldHaveFired = minutes.reduce(into: 0) { partial, next in
-            if Double(partial + next) <= elapsedMin {
-                partial += next
-            }
-        }
-        center.getPendingNotificationRequests { pending in
-            let pendingCount = pending.count
-            DispatchQueue.main.async {
-                self.ignoredCount = (self.minutes.count - pendingCount) - Int(shouldHaveFired)
-            }
-        }
-    }
-    
-    // MARK: Test burst
-    func testBurst() {
-        center.removeAllPendingNotificationRequests()
-        for i in 0..<5 {
-            let content = UNMutableNotificationContent()
-            content.title = "ping"
-            content.sound = .default
             let trigger = UNTimeIntervalNotificationTrigger(
-                timeInterval: 5.0 + Double(i) * 0.5,
+                timeInterval: cumulative,
                 repeats: false
             )
-            let req = UNNotificationRequest(
-                identifier: "test-\(i)",
+            let request = UNNotificationRequest(
+                identifier: "pat-\(index)",
                 content: content,
                 trigger: trigger
             )
-            center.add(req)
+            center.add(request)
+        }
+    }
+
+    private func updateIgnored() {
+        guard let start = startDate else { return }
+        let elapsedMin = elapsed / 60
+        var shouldHaveFired = 0
+        var total = 0
+        for min in minutes {
+            total += min
+            if Double(total) <= elapsedMin {
+                shouldHaveFired += 1
+            }
+        }
+        center.getPendingNotificationRequests { pending in
+            DispatchQueue.main.async {
+                self.ignoredCount = shouldHaveFired - (self.minutes.count - pending.count)
+            }
         }
     }
 }
 
-// MARK: - UI
+// MARK: - SwiftUI View
 struct RestraintView: View {
     @StateObject private var model = RestraintModel()
-    
+
     var body: some View {
         VStack(spacing: 30) {
             Text("Restraint")
                 .font(.largeTitle.bold())
-            
+
             Button(action: {
                 if model.running {
                     model.stop()
@@ -131,25 +148,19 @@ struct RestraintView: View {
             .buttonStyle(.borderedProminent)
             .tint(model.running ? .red : .green)
             .animation(.default, value: model.running)
-            
+
             if model.running {
                 Group {
                     Text("Time elapsed")
                     Text(String(format: "%.1f s", model.elapsed))
                         .font(.title2.monospacedDigit())
-                    
+
                     Text("Notifications ignored")
                     Text("\(model.ignoredCount)")
                         .font(.title2.monospacedDigit())
                 }
                 .transition(.opacity)
             }
-            
-            Button("Test 5 pings") {
-                model.testBurst()
-            }
-            .buttonStyle(.bordered)
-            .disabled(model.running)
         }
         .padding()
         .task {
@@ -158,9 +169,11 @@ struct RestraintView: View {
     }
 }
 
-// MARK: - App entry
+// MARK: - App Entry
 @main
 struct RestraintApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+
     var body: some Scene {
         WindowGroup {
             RestraintView()
